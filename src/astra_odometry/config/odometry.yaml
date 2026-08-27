@@ -1,0 +1,60 @@
+# Параметры нод rgbd_sync (rtabmap_sync) и rgbd_odometry (rtabmap_odom).
+#
+# Секция /** применяется ко всем нодам запуска; параметры, которые нода
+# не объявляла, просто игнорируются, поэтому один файл безопасно использовать
+# для обеих нод.
+#
+# ВАЖНО: параметры RTAB-Map (имена вида "Odom/...", "Vis/...", "Reg/...")
+# в ROS 2 объявлены как СТРОКИ — их значения обязательно в кавычках.
+
+/**:
+  ros__parameters:
+    # ---------- синхронизация и QoS (rgbd_sync + rgbd_odometry) ----------
+    topic_queue_size: 30
+    sync_queue_size: 50
+    qos: 3                 # 1=reliable, 2=best_effort, 3=system_default
+    qos_camera_info: 3
+
+    # ---------- rgbd_sync ----------
+    approx_sync: true
+    approx_sync_max_interval: 0.1   # сек; отбрасывать пары кадры, разошедшиеся сильнее
+
+    # ---------- rgbd_odometry ----------
+    wait_for_transform: 0.2
+    publish_null_when_lost: true
+    publish_tf: true
+
+    # ================= параметры RTAB-Map (тип string!) =================
+    # Стратегия: 0 = Frame-to-Map (по умолчанию, плавная и стабильная)
+    Odom/Strategy: "0"
+
+    # Детектор особенностей (GFTT) — уголки
+    GFTT/MaxCorners: "2000"
+    GFTT/MinDistance: "7"
+    GFTT/QualityLevel: "0.01"
+
+    # Сопоставление особенностей
+    Vis/MinInliers: "15"      # мин. число инлайеров для принятия движения кадр->кадр
+    Vis/MaxDepth: "0"         # 0 = без ограничения по дальности
+    Vis/Iterations: "30"
+
+    # Приём движения
+    Odom/MinInliers: "15"     # мин. число инлайеров итогового регистрационного решения
+    Odom/KeyFrameThr: "0.9"   # порог добавления ключевого кадра (перекрытие)
+    Odom/VisKeyFrameThr: "150"
+    Odom/GuessMotion: "true"  # предсказание движения по предыдущему шагу
+    Odom/Holonomic: "true"
+    Odom/FillInfoData: "true"
+
+    # Автоперезапуск через N секунд после потери трека (0 = отключено).
+    # Перезаписывается launch-аргументом odom_reset_countdown.
+    Odom/ResetCountdown: "1"
+
+    # Планарное движение (робот на полу): только x,y,yaw.launch-аргумент three_dof
+    Reg/Force3DoF: "false"
+
+    # Astra отдаёт цвет с лёгкой дисторсией. "true" (по умолчанию rtabmap):
+    # модель камеры берётся из camera_info как есть. Если у вашей камеры
+    # сильная дисторсия объектива — поставьте "false", тогда rtabmap будет
+    # ректифицировать кадры по калибровке (немного дороже по CPU).
+    Rtabmap/ImagesAlreadyRectified: "true"
