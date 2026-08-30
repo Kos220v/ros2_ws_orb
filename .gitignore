@@ -1,0 +1,15 @@
+# --- colcon build artifacts ---
+build/
+install/
+log/
+
+# --- внешний драйвер клонируется скриптом scripts/install.sh ---
+src/orbbec_camera/
+
+# --- python ---
+__pycache__/
+*.pyc
+
+# --- прочее ---
+*.db
+*.swp
