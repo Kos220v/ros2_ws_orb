@@ -25,46 +25,130 @@ USB_OUT="$(lsusb 2>/dev/null | grep -i '2bc5:' || true)"
 if [ -z "${USB_OUT}" ]; then
     bad "Камера не видна в lsusb."
     echo "      - Переподключите USB-кабель / проверьте порт"
-    echo "      - 'dmesg | tail -20' на предмет ошибок USB"
+    echo "      - В виртуальной машине: пробросьте USB-устройство в ВМ"
+    echo "        (VMware: VM -> Removable Devices -> Orbbec Astra -> Connect)"
+    echo "      - 'sudo dmesg | tail -20' на предмет ошибок USB"
     exit 1
 fi
 echo "${USB_OUT}" | sed 's/^/  /'
 
 echo
 echo "=== 2. Определение модели ==="
+# В правилах два формата строк:
+#   UVC:   SUBSYSTEMS=="usb", ATTRS{idVendor}=="2bc5", ATTRS{idProduct}=="0635", ... SYMLINK+="Femto"
+#   OpenNI: SUBSYSTEM=="usb", ATTR{idProduct}=="0401", ATTR{idVendor}=="2bc5", ... SYMLINK+="astra"
+# Поэтому PID/имя вытаскиваем независимо от порядка атрибутов, учитывая "}".
 RULES=""
 for candidate in "${RULES_CANDIDATES[@]}"; do
-    [ -f "$candidate" ] && RULES="$candidate" && break
+    if [ -f "$candidate" ]; then RULES="$candidate"; break; fi
 done
+found_model=""
 if [ -z "${RULES}" ]; then
-    info "Файл udev-правил не найден — запустите scripts/install.sh, чтобы определить модель по имени"
+    info "Файл udev-правил не найден — запустите scripts/install.sh"
 else
     while IFS= read -r line; do
-        pid="$(echo "$line" | grep -o 'idProduct=="[0-9a-fA-F]*"' | head -1 | sed 's/idProduct=="//;s/"//')"
-        model="$(echo "$line" | grep -o 'SYMLINK+="[^"]*"' | head -1 | sed 's/SYMLINK+="//;s/"//')"
+        pid="$(printf '%s' "$line" | sed -n 's/.*idProduct\}=="\([0-9a-fA-F]\{4\}\)".*/\1/p')"
+        model="$(printf '%s' "$line" | sed -n 's/.*SYMLINK+="\([^"]*\)".*/\1/p' | head -1)"
         if [ -n "$pid" ] && [ -n "$model" ] && echo "$USB_OUT" | grep -qi "2bc5:${pid}"; then
             ok "Ваша камера: ${model} (VID:PID 2bc5:${pid})"
+            found_model="$model"
         fi
     done < "${RULES}"
-    info "Если модель не определилась выше — это неизвестный драйверу PID;"
-    info "уточните модель: ros2 run orbbec_camera list_devices_node (после сборки)"
+    if [ -z "${found_model}" ]; then
+        info "Модель по PID не определилась — уточните: ros2 run orbbec_camera list_devices_node"
+    fi
 fi
 
 echo
 echo "=== 3. Скорость USB ==="
-BUS_OUT="$(lsusb -t 2>/dev/null | grep -A0 -B0 '2bc5' || true)"
-if [ -n "${BUS_OUT}" ]; then
-    echo "${BUS_OUT}" | sed 's/^/  /'
-    if echo "${BUS_OUT}" | grep -q '5000M'; then
-        ok "USB 3.0 (5000M) — запас по полосе есть"
-    elif echo "${BUS_OUT}" | grep -q '480M'; then
-        info "USB 2.0 (480M) — достаточно для 640x480@30 (цвет MJPG), но не для больших разрешений"
-    else
-        info "Низкая скорость шины — odometry может страдать от пропусков кадров"
+# lsusb -t не содержит VID:PID, поэтому матчим по номерам шины и устройства.
+SPEED_SHOWN=0
+while IFS= read -r line; do
+    busnum="$(printf '%s' "$line" | sed -n 's/^Bus 0*\([0-9]\{1,3\}\) Device.*/\1/p')"
+    devnum="$(printf '%s' "$line" | sed -n 's/^Bus [0-9]\{1,3\} Device 0*\([0-9]\{1,3\}\):.*/\1/p')"
+    [ -z "${busnum}" ] || [ -z "${devnum}" ] && continue
+    speed="$(lsusb -t 2>/dev/null | awk -v targetbus="${busnum}" -v targetdev="${devnum}" '
+        /^\/:/ {
+            cur = 0
+            if (match($0, /Bus [0-9]+\./)) {
+                b = substr($0, RSTART+4, RLENGTH-5)
+                gsub(/^0+/, "", b)
+                if (b+0 == targetbus+0) cur = 1
+            }
+            next
+        }
+        cur && match($0, /Dev [0-9]+,/) {
+            d = substr($0, RSTART+4, RLENGTH-5)
+            if (d+0 == targetdev+0) { print $NF; exit }
+        }
+    ' | head -1)"
+    if [ -n "${speed}" ]; then
+        info "Шина ${busnum}, устройство ${devnum}: ${speed}"
+        case "${speed}" in
+            5000M|10000M|20000M)
+                ok "USB 3.x — запас по полосе есть" ;;
+            480M)
+                info "USB 2.0 — достаточно для 640x480@30 Гц с цветом MJPG (наши настройки по умолчанию)" ;;
+            12M|1500M)
+                bad "Слишком медленная шина (${speed}) — потоков не хватит, одометрия работать не будет" ;;
+            *) info "Скорость: ${speed}" ;;
+        esac
+        SPEED_SHOWN=1
     fi
-else
-    info "Устройство не найдено в дереве lsusb -t (может требовать права или ещё не проинициализировалось)"
+done <<< "${USB_OUT}"
+if [ "${SPEED_SHOWN}" -eq 0 ]; then
+    info "Не удалось определить скорость из 'lsusb -t' (устройство могло ещё не проинициализироваться)"
 fi
+
+# Подсказка для виртуальных машин
+VIRT=""
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT="$(systemd-detect-virt -c 2>/dev/null || true)"
+fi
+if [ -n "${VIRT}" ] && [ "${VIRT}" != "none" ]; then
+    info "Обнаружена ВМ (${VIRT}). Для камеры это важно:"
+    info "  - камера должна быть проброшена в ВМ (VMware: VM -> Removable Devices -> Orbbec Astra -> Connect);"
+    info "  - USB 2.0 (480M) достаточно для настроек по умолчанию; USB 3.x даст запас:"
+    info "    в VMware включите контроллер USB 3.1 (VM Settings -> USB Controller) и подключайте к порту 3.0;"
+    info "  - не используйте USB-хаб; при фризах изображения уменьшите color_fps/depth_fps до 15."
+fi
+
+echo
+echo "=== 3a. Захват интерфейсов камеры драйверами ядра ==="
+# Если ядро привязало драйвер (например, snd-usb-audio к микрофону Astra) хоть к
+# одному интерфейсу, libusb получает EBUSY, и OrbbecSDK не видит камеру
+# ("Current found device(s): (0)") даже при корректных правах.
+while IFS= read -r line; do
+    busnum="$(printf '%s' "$line" | sed -n 's/^Bus 0*\([0-9]\{1,3\}\) Device.*/\1/p')"
+    devnum="$(printf '%s' "$line" | sed -n 's/^Bus [0-9]\{1,3\} Device 0*\([0-9]\{1,3\}\):.*/\1/p')"
+    [ -z "${busnum}" ] || [ -z "${devnum}" ] && continue
+    claims="$(lsusb -t 2>/dev/null | awk -v tb="${busnum}" -v td="${devnum}" '
+        /^\/:/ {
+            cur = 0
+            if (match($0, /Bus [0-9]+\./)) {
+                b = substr($0, RSTART+4, RLENGTH-5)
+                gsub(/^0+/, "", b)
+                if (b+0 == tb+0) cur = 1
+            }
+            next
+        }
+        cur && match($0, /Dev [0-9]+,/) {
+            d = substr($0, RSTART+4, RLENGTH-5)
+            if (d+0 == td+0 && match($0, /Driver=[^,]*/)) {
+                drv = substr($0, RSTART+7, RLENGTH-7)
+                if (drv != "[none]") print drv
+            }
+        }' | sort -u | paste -sd' ' -)"
+    if [ -n "${claims}" ]; then
+        bad "Интерфейсы камеры захвачены драйверами ядра: ${claims}"
+        info "OrbbecSDK такую камеру не увидит. Фикс для аудио-интерфейсов Astra:"
+        info "  мгновенно:  echo \"2-${busnum}:1.1\" | sudo tee /sys/bus/usb/drivers/snd-usb-audio/unbind  (и :1.2)"
+        info "  навсегда:   echo 'options snd-usb-audio quirks=2bc5:0401:IGNORE' | sudo tee /etc/modprobe.d/orbbec-astra-noaudio.conf && перезагрузка"
+        info "  (scripts/install.sh делает это автоматически при следующем запуске)"
+    else
+        ok "Интерфейсы камеры свободны (Driver=[none] у всех)"
+    fi
+done <<< "${USB_OUT}"
 
 echo
 echo "=== 4. udev-правила и права доступа ==="
@@ -77,6 +161,7 @@ if id -nG "${SUDO_USER:-$USER}" 2>/dev/null | grep -qw video; then
     ok "Пользователь состоит в группе video"
 else
     bad "Пользователь НЕ в группе video: sudo usermod -aG video \$USER && перелогин"
+    info "Не блокирует работу: наши правила дают MODE 0666 (доступ всем), но группу лучше добавить"
 fi
 DEV_OUT="$(ls -l /dev 2>/dev/null | grep -iE 'astra|orbbec|ob_' || true)"
 if [ -n "${DEV_OUT}" ]; then
@@ -85,12 +170,52 @@ else
     info "Симлинки /dev/astra* не найдены (появятся после установки правил и переподключения камеры)"
 fi
 
+# Права на сами USB-узлы (правила применяются в момент подключения)
+while IFS= read -r line; do
+    busnum="$(printf '%s' "$line" | sed -n 's/^Bus 0*\([0-9]\{1,3\}\) Device.*/\1/p')"
+    devnum="$(printf '%s' "$line" | sed -n 's/^Bus [0-9]\{1,3\} Device 0*\([0-9]\{1,3\}\):.*/\1/p')"
+    [ -z "${busnum}" ] || [ -z "${devnum}" ] && continue
+    node="$(printf '/dev/bus/usb/%03d/%03d' "${busnum}" "${devnum}")"
+    if [ -c "${node}" ]; then
+        p="$(stat -c '%A' "${node}")"
+        if [[ "${p}" == crw-rw-rw-* ]]; then
+            ok "Права ${node}: ${p} — доступ открыт"
+        else
+            bad "Права ${node}: ${p} — нет записи для всех."
+            info "Правила применяются при ПОДКЛЮЧЕНИИ камеры: переподключите её (в ВМ — через меню VMware)"
+        fi
+    else
+        info "Узел ${node} не найден (устройство могло появиться до монтирования /dev/bus/usb)"
+    fi
+done <<< "${USB_OUT}"
+
 echo
-echo "=== 5. Свежие события ядра по USB (последние ошибки, если есть) ==="
+echo "=== 5. Кто может держать камеру (процессы и блокировки) ==="
+# OrbbecSDK v1.10 прячет устройства, открытые другим процессом:
+# если драйвер завис/остался от прошлого запуска, list_devices покажет (0).
+PROC_OUT="$(ps -eo pid,cmd 2>/dev/null | grep -E 'ob_camera|orbbec|component_container|list_devices' | grep -v grep || true)"
+if [ -n "${PROC_OUT}" ]; then
+    bad "Обнаружены процессы, которые могут держать камеру:"
+    echo "${PROC_OUT}" | sed 's/^/  /'
+    info "Завершите их: pkill -f component_container; pkill -f ob_camera"
+else
+    ok "Посторонних процессов драйвера нет"
+fi
+LOCK_OUT="$(ls -la /dev/shm 2>/dev/null | grep -iE 'orbbec|ob_|astra' || true)"
+if [ -n "${LOCK_OUT}" ]; then
+    info "Файлы блокировок в /dev/shm:"
+    echo "${LOCK_OUT}" | sed 's/^/  /'
+    info "Если процессов драйвера нет (выше пусто), а файлы остались — зависшие: rm -f /dev/shm/orbbec_device_lock*"
+else
+    ok "Зависших блокировок /dev/shm нет"
+fi
+
+echo
+echo "=== 6. Свежие события ядра по USB (последние ошибки, если есть) ==="
 if command -v dmesg >/dev/null 2>&1 && dmesg 2>/dev/null | tail -200 | grep -iE 'usb|uvc' >/dev/null; then
     dmesg 2>/dev/null | tail -200 | grep -iE 'usb|uvc' | tail -8 | sed 's/^/  /'
 else
-    info "dmesg недоступен без root или ошибок нет"
+    info "dmesg недоступен без root или ошибок нет (попробуйте: sudo dmesg | tail -30)"
 fi
 
 echo

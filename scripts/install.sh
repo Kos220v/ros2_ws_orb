@@ -23,7 +23,13 @@ die()  { echo -e "\033[1;31m[install] ОШИБКА:\033[0m $*" >&2; exit 1; }
 [[ -f /opt/ros/${ROS_DISTRO_NAME}/setup.bash ]] || \
     die "ROS 2 ${ROS_DISTRO_NAME} не найден в /opt/ros. Установите Jazzy: https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debians.html"
 
+# Скрипты инициализации ament не рассчитаны на `set -u`: они проверяют
+# переменные (AMENT_TRACE_SETUP_FILES и др.) без значений по умолчанию,
+# и sourcing падает с "unbound variable". Поэтому на время source
+# отключаем nounset (рекомендация colcon/ROS 2 для workspaces).
+set +u
 source "/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
+set -u
 log "ROS_DISTRO=${ROS_DISTRO_NAME}"
 
 # --- 2. Системные пакеты -----------------------------------------------------
@@ -73,6 +79,21 @@ fi
 if ! id -nG "$USER" | grep -qw video; then
     log "Добавляю ${USER} в группу video (вступит в силу после перелогина)"
     sudo usermod -aG video "$USER"
+fi
+
+# --- 4b. Аудио-интерфейсы Astra не должны захватываться ядром ----------------
+# У классических Astra есть микрофонный (Audio) интерфейс. Если ядро привязывает
+# к нему snd-usb-audio, libusb получает EBUSY, и OrbbecSDK не видит камеру
+# ("Current found device(s): (0)"). Запрещаем драйверу трогать камеры Orbbec.
+QUIRKS="$(lsusb 2>/dev/null | sed -n 's/.*2bc5:\([0-9a-fA-F]\{4\}\).*/2bc5:\1:IGNORE/p' | sort -u | paste -sd, -)"
+[ -z "${QUIRKS}" ] && QUIRKS="2bc5:0401:IGNORE"   # классическая Astra по умолчанию
+AUDIO_CONF="/etc/modprobe.d/orbbec-astra-noaudio.conf"
+if grep -q "quirks=" "${AUDIO_CONF}" 2>/dev/null; then
+    log "Модуль-исключение для snd-usb-audio уже настроен (${AUDIO_CONF})"
+else
+    log "Запрещаю snd-usb-audio захватывать аудио-интерфейсы Orbbec (${QUIRKS})"
+    echo "options snd-usb-audio quirks=${QUIRKS}" | sudo tee "${AUDIO_CONF}" >/dev/null
+    warn "Для применения нужна перезагрузка (или: sudo modprobe -r snd-usb-audio и переподключить камеру)"
 fi
 
 # --- 5. Сборка ----------------------------------------------------------------
